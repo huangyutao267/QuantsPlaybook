@@ -98,7 +98,7 @@ class FactorPipeline:
 
     def _prepare_data(self) -> Tuple[np.ndarray, pd.DatetimeIndex, pd.Index]:
         """获取并预处理数据，创建滑动窗口。"""
-        begin_dt = get_trade_days(end_date=self.start_dt, count=self.window)[
+        begin_dt = get_trade_days(end_date=self.start_dt, count=-self.window)[
             0
         ].strftime("%Y-%m-%d")
         provider = QlibDataProvider(self.codes, begin_dt, self.end_dt)

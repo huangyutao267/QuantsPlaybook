@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 '''
 Author: Hugo
 Date: 2025-11-06 21:12:00
@@ -31,7 +33,12 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    TORCH_AVAILABLE = False
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_fixed
 from tqdm import tqdm
 
@@ -90,16 +97,16 @@ class DLESCClustering:
         self.random_state = random_state
         self.tol = tol
 
-        # 强制使用GPU
-        if not torch.cuda.is_available():
-            raise RuntimeError("此算法需要GPU支持，但未检测到CUDA设备")
-
-        if device is None:
-            self.device = torch.device("cuda")
+        self._use_torch = TORCH_AVAILABLE and torch.cuda.is_available()
+        if self._use_torch:
+            if device is None:
+                self.device = torch.device("cuda")
+            else:
+                self.device = torch.device(device)
+            logger.info(f"使用GPU设备: {self.device}")
         else:
-            self.device = torch.device(device)
-
-        logger.info(f"使用GPU设备: {self.device}")
+            self.device = "cpu"
+            logger.warning("CUDA/torch unavailable, using numpy CPU fallback.")
 
         # Initialize parameters
         self.eta = None
@@ -113,6 +120,12 @@ class DLESCClustering:
         """
         设置随机数生成器，确保可复现性和正确的随机性管理
         """
+        if not self._use_torch:
+            self.cpu_rng = np.random.default_rng(self.random_state)
+            self.gpu_rng = None
+            self.kmeans_seed = self.random_state + 1000 if self.random_state is not None else None
+            return
+
         if self.random_state is not None:
             # 设置全局PyTorch种子
             torch.manual_seed(self.random_state)
@@ -455,6 +468,9 @@ class DLESCClustering:
                 - lead_cluster_size: 领先聚类大小
                 - lag_cluster_size: 滞后聚类大小
         """
+        if not self._use_torch:
+            return self._fit_single_cpu(A)
+
         # 转换为PyTorch张量并移到GPU
         A_tensor = torch.from_numpy(A).float().to(self.device)
 
@@ -502,6 +518,80 @@ class DLESCClustering:
         }
 
         return results
+
+    def _fit_single_cpu(self, A: np.ndarray) -> Dict[str, Any]:
+        rng = np.random.default_rng(self.random_state)
+        eta = float(rng.uniform(0.1, 0.5))
+
+        for iteration in range(self.n_iterations):
+            old_eta = eta
+            eta_clipped = np.clip(eta, 1e-10, 0.5 - 1e-10)
+            w_directional = np.log((1 - eta_clipped) / eta_clipped)
+            w_symmetric = np.log(1 / (4 * eta_clipped * (1 - eta_clipped)))
+
+            a_diff = A - A.T
+            a_sum = A + A.T
+            h = w_symmetric * a_sum + 1j * w_directional * a_diff
+            eigenvalues, eigenvectors = np.linalg.eigh(h)
+            v1 = eigenvectors[:, np.argmax(eigenvalues.real)]
+
+            embedding = np.column_stack([v1.real, v1.imag])
+            labels = self._kmeans_numpy(embedding, rng)
+
+            cluster_0 = np.where(labels == 0)[0]
+            cluster_1 = np.where(labels == 1)[0]
+            flow_0_to_1 = A[np.ix_(cluster_0, cluster_1)].sum()
+            flow_1_to_0 = A[np.ix_(cluster_1, cluster_0)].sum()
+
+            if flow_0_to_1 >= flow_1_to_0:
+                lead_cluster, lag_cluster = cluster_0, cluster_1
+            else:
+                lead_cluster, lag_cluster = cluster_1, cluster_0
+                flow_0_to_1, flow_1_to_0 = flow_1_to_0, flow_0_to_1
+
+            total_flow = flow_0_to_1 + flow_1_to_0
+            eta = 0.25 if total_flow == 0 else float(
+                np.clip(
+                    min(flow_0_to_1 / total_flow, flow_1_to_0 / total_flow),
+                    1e-10,
+                    0.5 - 1e-10,
+                )
+            )
+            if abs(eta - old_eta) < self.tol:
+                break
+
+        return {
+            "lead_cluster": lead_cluster,
+            "lag_cluster": lag_cluster,
+            "eta": eta,
+            "n_iterations": iteration + 1,
+            "lead_cluster_size": len(lead_cluster),
+            "lag_cluster_size": len(lag_cluster),
+        }
+
+    def _kmeans_numpy(self, x: np.ndarray, rng: np.random.Generator, max_iter: int = 100) -> np.ndarray:
+        n_samples = x.shape[0]
+        if n_samples < 2:
+            return np.zeros(n_samples, dtype=int)
+
+        centroid_indices = rng.choice(n_samples, size=2, replace=False)
+        centroids = x[centroid_indices].copy()
+
+        for _ in range(max_iter):
+            distances = np.linalg.norm(x[:, None, :] - centroids[None, :, :], axis=2)
+            labels = np.argmin(distances, axis=1)
+
+            new_centroids = centroids.copy()
+            for cluster_id in range(2):
+                members = x[labels == cluster_id]
+                if len(members) > 0:
+                    new_centroids[cluster_id] = members.mean(axis=0)
+
+            if np.allclose(centroids, new_centroids, atol=self.tol):
+                break
+            centroids = new_centroids
+
+        return labels
 
     def fit(self, A: np.ndarray) -> Dict[str, Any]:
         """
